@@ -115,8 +115,6 @@ impl<'a> Pipeline for Cube<'a> {
 
         pnt = (pnt + 0.5) * f_count_voxels;
 
-        // println!("starting point: {:?}", pnt);
-
         // dda
         let mut map_pos = Vec3::new(
             floor(pnt.x) as i32,
@@ -144,7 +142,7 @@ impl<'a> Pipeline for Cube<'a> {
             i_count_voxels.z - 1,
         );
 
-        for _ in 0..200 {
+        for _ in 0..150 {
             let is_inside = map_pos.x >= 0
                 && map_pos.x < i_count_voxels.x
                 && map_pos.y >= 0
@@ -207,7 +205,7 @@ const W: usize = 640;
 const H: usize = 480;
 
 fn main() {
-    let vox = dot_vox::load("./monu1.vox").unwrap();
+    let vox = dot_vox::load(r#"C:\Users\dylan\dev\cpu-voxel\monu1.vox"#).unwrap();
     let model = vox.models.get(0).unwrap();
 
     let voxel_dimensions = Vec3::new(model.size.x, model.size.y, model.size.z);
@@ -251,20 +249,22 @@ fn main() {
 
     println!("voxel_dimeonsions: {:?}", voxel_dimensions);
     println!("scale {}", (model.size.x as f32) / 8.0);
+    let proj = glam_mat4_to_maths_mat4(glam::Mat4::perspective_rh(
+        60_f32.to_radians(),
+        W as f32 / H as f32,
+        1.0,
+        1000.0,
+    ));
+    let view = glam_mat4_to_maths_mat4(glam::Mat4::look_at_rh(
+        camera_world_position.xyz(),
+        camera_target,
+        glam::Vec3::Y,
+    ));
 
+    let mut time_running = std::time::Instant::now();
+    let mut now;
     for i in 0.. {
-        let proj = glam_mat4_to_maths_mat4(glam::Mat4::perspective_rh(
-            60_f32.to_radians(),
-            W as f32 / H as f32,
-            1.0,
-            1000.0,
-        ));
-        let view = glam_mat4_to_maths_mat4(glam::Mat4::look_at_rh(
-            camera_world_position.xyz(),
-            camera_target,
-            glam::Vec3::Y,
-        ));
-
+        now = std::time::Instant::now();
         let model = glam_mat4_to_maths_mat4(glam::Mat4::from_scale_rotation_translation(
             glam::Vec3::new(
                 (model.size.x as f32) / 8.0,
@@ -321,6 +321,11 @@ fn main() {
             win.update_with_buffer(color.as_ref(), W, H).unwrap();
         } else {
             break;
+        }
+
+        if time_running.elapsed().as_secs() == 2 {
+            println!("fps: {}", 1.0 / now.elapsed().as_secs_f32());
+            time_running = std::time::Instant::now();
         }
     }
 }
