@@ -1,6 +1,11 @@
+use std::f32::MAX;
+
+use dot_vox::{Model, Voxel};
 use euc::{buffer::Buffer2d, rasterizer, Interpolate, Pipeline, Target};
 use glam::Vec4Swizzles;
 use maths_rs::prelude::*;
+use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use serde::Serialize;
 
 fn glam_mat4_to_maths_mat4(mat: glam::Mat4) -> Mat4<f32> {
     let glam: [f32; 16] = mat.transpose().to_cols_array();
@@ -17,9 +22,18 @@ struct Cube<'a> {
     inverse_model: Mat4<f32>,
     camera_world_position: Vec4<f32>,
     voxel_dimensions: Vec3<u32>,
-    voxel_texture: &'a [u8],
+    voxel_texture: &'a [VoxelTexel],
     palette_texture: Vec<Vec4<f32>>,
     positions: &'a [Vec4<f32>],
+}
+
+fn sd_box(p: Vec3<f32>, b: Vec3<f32>) -> f32 {
+    let q = abs(p) - b;
+    length(max(q, Vec3f::zero())) + min(max(q.x, max(q.y, q.z)), 0.0)
+}
+
+fn sd_sphere(p: Vec3<f32>, s: f32) -> f32 {
+    length(p) - s
 }
 
 impl<'a> Cube<'a> {
@@ -89,111 +103,58 @@ impl<'a> Pipeline for Cube<'a> {
 
     #[inline(always)]
     fn frag(&self, frag_in: &Self::VsOut) -> Self::Pixel {
-        let i_count_voxels = Vec3::new(
-            self.voxel_dimensions.x as i32,
-            self.voxel_dimensions.y as i32,
-            self.voxel_dimensions.z as i32,
-        );
-        let f_count_voxels = Vec3::new(
-            self.voxel_dimensions.x as f32,
-            self.voxel_dimensions.y as f32,
-            self.voxel_dimensions.z as f32,
-        );
         let direction = normalize(frag_in.frag_direction);
-        let mut pnt = frag_in.frag_origin;
-
+        let mut point = frag_in.frag_origin;
         let bounding_box_min = Vec3::new(-0.5, -0.5, -0.5);
         let bounding_box_max = Vec3::new(0.5, 0.5, 0.5);
 
-        pnt = pnt
+        point = point
             + direction
                 * max(
                     0.0,
-                    self.intersect_aabb(pnt, direction, bounding_box_min, bounding_box_max)
+                    self.intersect_aabb(point, direction, bounding_box_min, bounding_box_max)
                         .x,
                 );
 
-        pnt = (pnt + 0.5) * f_count_voxels;
-
-        // dda
-        let mut map_pos = Vec3::new(
-            floor(pnt.x) as i32,
-            floor(pnt.y) as i32,
-            floor(pnt.z) as i32,
-        );
-        let delta_dist = abs(length(direction) / direction);
-        let ray_dir_sign = signum(direction);
-        let ray_step = Vec3::new(
-            ray_dir_sign.x as i32,
-            ray_dir_sign.y as i32,
-            ray_dir_sign.z as i32,
-        );
-        let mut side_dist = (ray_dir_sign
-            * (Vec3::new(map_pos.x as f32, map_pos.y as f32, map_pos.z as f32) - pnt)
-            + (ray_dir_sign * 0.5)
-            + 0.5)
-            * delta_dist;
-        let mut mask = [false, false, false];
-
-        let zero = Vec3::new(0, 0, 0);
-        let seven = Vec3::new(
-            i_count_voxels.x - 1,
-            i_count_voxels.y - 1,
-            i_count_voxels.z - 1,
+        let scale = 2.0;
+        point *= vec3f(
+            self.voxel_dimensions.x as f32 / scale,
+            self.voxel_dimensions.y as f32 / scale,
+            self.voxel_dimensions.z as f32 / scale,
         );
 
-        for _ in 0..150 {
-            let is_inside = map_pos.x >= 0
-                && map_pos.x < i_count_voxels.x
-                && map_pos.y >= 0
-                && map_pos.y < i_count_voxels.y
-                && map_pos.z >= 0
-                && map_pos.z < i_count_voxels.z;
-
-            if is_inside {
-                let voxel_index = map_pos.x
-                    + map_pos.y * i_count_voxels.x
-                    + map_pos.z * i_count_voxels.x * i_count_voxels.y;
-                let palette_index = self.voxel_texture[voxel_index as usize];
-
-                if palette_index != 0 {
-                    let mut color = self.palette_texture[palette_index as usize];
-
-                    if mask[0] {
-                        color *= 0.75;
-                    }
-                    if mask[1] {
-                        color *= 1.0;
-                    }
-                    if mask[2] {
-                        color *= 0.5;
-                    }
-
-                    return ((color[2] * 255.0) as u32)
-                        | ((color[1] * 255.0) as u32) << 8
-                        | ((color[0] * 255.0) as u32) << 16
-                        | ((color[3] * 255.0) as u32) << 24;
+        let voxel = self.voxel_texture.par_iter().find_any(|item| {
+            if item.palette_index == 0 {
+                return false;
+            }
+            let sdf_size = 0.5;
+            let mut point_clone = point
+                + ((vec3f(item.x as f32, item.y as f32, item.z as f32))
+                    - vec3f(
+                        self.voxel_dimensions.x as f32 / scale,
+                        self.voxel_dimensions.y as f32 / scale,
+                        self.voxel_dimensions.z as f32 / scale,
+                    ));
+            for _ in 0..30 {
+                let distance = sd_box(point_clone, Vec3::new(sdf_size, sdf_size, sdf_size));
+                if distance < 0.001 {
+                    return true;
                 }
-            }
 
-            mask = [
-                side_dist.x <= min(side_dist.y, side_dist.z),
-                side_dist.y <= min(side_dist.x, side_dist.z),
-                side_dist.z <= min(side_dist.x, side_dist.y),
-            ];
-            side_dist += Vec3::new(
-                mask[0] as i32 as f32,
-                mask[1] as i32 as f32,
-                mask[2] as i32 as f32,
-            ) * delta_dist;
-            map_pos += Vec3::new(mask[0] as i32, mask[1] as i32, mask[2] as i32) * ray_step;
-
-            if clamp(map_pos, zero, seven) != map_pos {
-                break;
+                point_clone += direction * distance;
             }
+            false
+        });
+
+        if let Some(item) = voxel {
+            let bytes = self.palette_texture[item.palette_index as usize] * 255.0;
+            return (bytes[2] as u32)
+                | (bytes[1] as u32) << 8
+                | (bytes[0] as u32) << 16
+                | 0xFF << 24;
         }
 
-        let bytes = Vec4::new(0.0, 0.0, 0.0, 255.0);
+        let bytes = Vec4::new(0.0, 0.0, 255.0, 255.0);
         (bytes[2] as u32)
             | (bytes[1] as u32) << 8
             | (bytes[0] as u32) << 16
@@ -204,21 +165,89 @@ impl<'a> Pipeline for Cube<'a> {
 const W: usize = 640;
 const H: usize = 480;
 
+#[derive(Copy, Clone, Default, Serialize, Debug)]
+struct VoxelTexel {
+    palette_index: u8,
+    distance: f32,
+    x: u8,
+    y: u8,
+    z: u8,
+}
+
+fn signed_distance(model: &Model, point: Vec3<f32>) -> f32 {
+    let mut min_distance = std::f32::MAX;
+
+    for voxel in &model.voxels {
+        let voxel_center = Vec3::new(voxel.x as f32, voxel.y as f32, voxel.z as f32);
+        let distance = sd_box(point - voxel_center, Vec3::new(0.2, 0.2, 0.2));
+        min_distance = min(min_distance, distance);
+    }
+
+    min_distance
+}
+
 fn main() {
-    let vox = dot_vox::load(r#"C:\Users\dylan\dev\cpu-voxel\monu1.vox"#).unwrap();
+    let vox = dot_vox::load(r#"C:\Users\dylan\dev\cpu-voxel\castle.vox"#).unwrap();
     let model = vox.models.get(0).unwrap();
 
     let voxel_dimensions = Vec3::new(model.size.x, model.size.y, model.size.z);
-    let mut voxel_texture: Vec<u8> =
-        vec![0; model.size.x as usize * model.size.y as usize * model.size.z as usize];
+    let mut voxel_texture: Vec<VoxelTexel> =
+        vec![
+            VoxelTexel::default();
+            model.size.x as usize * model.size.y as usize * model.size.z as usize
+        ];
     let mut palette_texture: Vec<Vec4<f32>> = vec![Vec4::new(0.0, 0.0, 0.0, 0.0); 257];
 
-    for voxel in &model.voxels {
-        let index = voxel.x as usize
-            + voxel.y as usize * model.size.x as usize
-            + voxel.z as usize * model.size.x as usize * model.size.y as usize;
-        voxel_texture[index] = voxel.i + 1;
+    println!("total len {}", voxel_texture.len());
+
+    for x in 0..model.size.x {
+        for y in 0..model.size.y {
+            for z in 0..model.size.z {
+                let i = x + y * model.size.x + z * model.size.x * model.size.y;
+
+                if let Some(voxel) = model
+                    .voxels
+                    .iter()
+                    .find(|v| v.x == x as u8 && v.y == y as u8 && v.z == z as u8)
+                {
+                    voxel_texture[i as usize].palette_index = voxel.i + 1;
+                }
+                voxel_texture[i as usize].x = x as u8;
+                voxel_texture[i as usize].y = y as u8;
+                voxel_texture[i as usize].z = z as u8;
+            }
+        }
     }
+
+    let scale = 2.0;
+    let direction = vec3f(0.0, 0.0, 1.0);
+    let voxel = voxel_texture.par_iter().find_any(|item| {
+        if item.palette_index == 0 {
+            return false;
+        }
+        let sdf_size = 0.5;
+        let mut point_clone = ((vec3f(item.x as f32, item.y as f32, item.z as f32))
+            - vec3f(
+                voxel_dimensions.x as f32 / scale,
+                voxel_dimensions.y as f32 / scale,
+                voxel_dimensions.z as f32 / scale,
+            ));
+        for _ in 0..30 {
+            let distance = sd_box(point_clone, Vec3::new(sdf_size, sdf_size, sdf_size));
+            if distance < 0.001 {
+                return true;
+            }
+
+            point_clone += distance * direction;
+        }
+        false
+    });
+
+    serde_json::to_writer_pretty(
+        std::fs::File::create(r#"./castle.json"#).unwrap(),
+        &voxel_texture,
+    )
+    .unwrap();
 
     for (i, color) in vox.palette.iter().enumerate() {
         palette_texture[i + 1] = Vec4::new(
@@ -263,60 +292,60 @@ fn main() {
 
     let mut time_running = std::time::Instant::now();
     let mut now;
+    now = std::time::Instant::now();
+    let model = glam_mat4_to_maths_mat4(glam::Mat4::from_scale_rotation_translation(
+        glam::Vec3::new(
+            (model.size.x as f32) / 8.0,
+            (model.size.y as f32) / 8.0,
+            (model.size.z as f32) / 8.0,
+        ),
+        glam::Quat::from_rotation_x(-1.5),
+        glam::Vec3::new(0.0, 0.0, -2.0),
+    ));
+
+    color.clear(0);
+    depth.clear(1.0);
+
+    Cube {
+        proj,
+        view,
+        model,
+        inverse_model: model.inverse(),
+        voxel_texture: &voxel_texture,
+        palette_texture: palette_texture.clone(),
+        camera_world_position: Vec4::new(
+            camera_world_position.x,
+            camera_world_position.y,
+            camera_world_position.z,
+            1.0,
+        ),
+        voxel_dimensions,
+        positions: &[
+            Vec4::new(-1.0, -1.0, -1.0, 1.0), // 0
+            Vec4::new(-1.0, -1.0, 1.0, 1.0),  // 1
+            Vec4::new(-1.0, 1.0, -1.0, 1.0),  // 2
+            Vec4::new(-1.0, 1.0, 1.0, 1.0),   // 3
+            Vec4::new(1.0, -1.0, -1.0, 1.0),  // 4
+            Vec4::new(1.0, -1.0, 1.0, 1.0),   // 5
+            Vec4::new(1.0, 1.0, -1.0, 1.0),   // 6
+            Vec4::new(1.0, 1.0, 1.0, 1.0),    // 7
+        ],
+    }
+    .draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
+        &[
+            // -x
+            0, 3, 2, 0, 1, 3, // +x
+            7, 4, 6, 5, 4, 7, // -y
+            5, 0, 4, 1, 0, 5, // +y
+            2, 7, 6, 2, 3, 7, // -z
+            0, 6, 4, 0, 2, 6, // +z
+            7, 1, 5, 3, 1, 7,
+        ],
+        &mut color,
+        Some(&mut depth),
+    );
+
     for i in 0.. {
-        now = std::time::Instant::now();
-        let model = glam_mat4_to_maths_mat4(glam::Mat4::from_scale_rotation_translation(
-            glam::Vec3::new(
-                (model.size.x as f32) / 8.0,
-                (model.size.y as f32) / 8.0,
-                (model.size.z as f32) / 8.0,
-            ),
-            glam::Quat::from_rotation_x(-1.5) * glam::Quat::from_rotation_z(i as f32 * 0.10),
-            glam::Vec3::new(0.0, 0.0, -10.0),
-        ));
-
-        color.clear(0);
-        depth.clear(1.0);
-
-        Cube {
-            proj,
-            view,
-            model,
-            inverse_model: model.inverse(),
-            voxel_texture: &voxel_texture,
-            palette_texture: palette_texture.clone(),
-            camera_world_position: Vec4::new(
-                camera_world_position.x,
-                camera_world_position.y,
-                camera_world_position.z,
-                1.0,
-            ),
-            voxel_dimensions,
-            positions: &[
-                Vec4::new(-1.0, -1.0, -1.0, 1.0), // 0
-                Vec4::new(-1.0, -1.0, 1.0, 1.0),  // 1
-                Vec4::new(-1.0, 1.0, -1.0, 1.0),  // 2
-                Vec4::new(-1.0, 1.0, 1.0, 1.0),   // 3
-                Vec4::new(1.0, -1.0, -1.0, 1.0),  // 4
-                Vec4::new(1.0, -1.0, 1.0, 1.0),   // 5
-                Vec4::new(1.0, 1.0, -1.0, 1.0),   // 6
-                Vec4::new(1.0, 1.0, 1.0, 1.0),    // 7
-            ],
-        }
-        .draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
-            &[
-                // -x
-                0, 3, 2, 0, 1, 3, // +x
-                7, 4, 6, 5, 4, 7, // -y
-                5, 0, 4, 1, 0, 5, // +y
-                2, 7, 6, 2, 3, 7, // -z
-                0, 6, 4, 0, 2, 6, // +z
-                7, 1, 5, 3, 1, 7,
-            ],
-            &mut color,
-            Some(&mut depth),
-        );
-
         if win.is_open() {
             win.update_with_buffer(color.as_ref(), W, H).unwrap();
         } else {
